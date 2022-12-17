@@ -1,3 +1,15 @@
+**Fork of https://github.com/Stability-AI/stablediffusion.git, all credit goes to them**
+The only difference is adapting the code for https://medium.com/@enryu9000/TODO.
+
+You can get checkpoint [here](https://huggingface.co/enryu43/TODO/tree/main). You need `original_ckpt.bin`, unless you want to use the model via Diffusers.
+
+Some examples:
+
+```commandline
+python txt2img.py --ckpt <PATH-TO-CHECKPOINT> --seed=9831744  --plms --n_samples=1 --steps=50 --scale=8.0 --prompt="1girl, smile, rating_s, adjusted_score_perc_100, score_perc_100"
+python img2img.py --ckpt <PATH-TO-CHECKPOINT> --n_samples=1 --scale=8.0 --prompt "1girl, solo, smile, rating_s, adjusted_score_perc_100, score_perc_100" --init-img assets/stable-samples/img2img/sketch-mountains-input.jpg --strength 0.8
+```
+
 # Stable Diffusion Version 2
 ![t2i](assets/stable-samples/txt2img/768/merged-0006.png)
 ![t2i](assets/stable-samples/txt2img/768/merged-0002.png)

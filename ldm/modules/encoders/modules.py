@@ -4,6 +4,8 @@ from torch.utils.checkpoint import checkpoint
 
 from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel
 
+from ldm.modules.x_transformer import Encoder, TransformerWrapper
+
 import open_clip
 from ldm.util import default, count_params
 
@@ -210,4 +212,184 @@ class FrozenCLIPT5Encoder(AbstractEncoder):
         t5_z = self.t5_encoder.encode(text)
         return [clip_z, t5_z]
 
+
+class SetTransformerEmbedder(AbstractEncoder):
+    """Some transformer encoder layers"""
+    def __init__(self, n_embed, n_layer, vocab_size, max_seq_len=77, device="cuda"):
+        super().__init__()
+        self.device = device
+        self.transformer = TransformerWrapper(num_tokens=vocab_size, max_seq_len=max_seq_len,
+                                              attn_layers=Encoder(dim=n_embed, depth=n_layer),
+                                              use_pos_emb=False)
+
+    def forward(self, tokens):
+        tokens = tokens.to(self.device)  # meh
+        z = self.transformer(tokens, return_embeddings=True)
+        return z
+
+    def encode(self, x):
+        return self(x)
+
+class TransformerEmbedder(AbstractEncoder):
+    """Some transformer encoder layers"""
+    def __init__(self, n_embed, n_layer, vocab_size, max_seq_len=77, device="cuda"):
+        super().__init__()
+        self.device = device
+        self.transformer = TransformerWrapper(num_tokens=vocab_size, max_seq_len=max_seq_len,
+                                              attn_layers=Encoder(dim=n_embed, depth=n_layer))
+
+    def forward(self, tokens):
+        tokens = tokens.to(self.device)  # meh
+        z = self.transformer(tokens, return_embeddings=True)
+        return z
+
+    def encode(self, x):
+        return self(x)
+
+
+import numpy as np
+import transformers
+import hashlib
+import zlib
+from base64 import urlsafe_b64decode as b64d
+import six
+
+MAX_AUG = 50
+
+class TagTokenizer(object):
+    def __init__(self, ar_model_path, max_length, device='cuda'):
+        self.device = device
+        self.max_length = max_length
+
+        # TODO: this is hacky, can we do smth nicer? OmegaConf doesn't seem to allow specifying relative paths.
+        import os
+        our_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(our_dir, 'tags.config'), 'rb') as f:
+          raw_tags = f.read()
+        id2tag = zlib.decompress(b64d(raw_tags))
+        id2tag = six.ensure_str(id2tag).split(',')
+        tag2id = {t: i for i, t in enumerate(id2tag)}
+        id2tag = {i: t for t, i in tag2id.items()}
+
+        self.vocab_size = len(id2tag)
+        self.tag2id = tag2id
+        self.id2tag = id2tag
+        self.cache = {}
+        self.bos = 2999
+        self.eos = 2999
+        self.pad = 2999
+        self.pad_token_id = self.pad
+
+        vocab_size = len(id2tag)
+        self.BOS = vocab_size
+        self.EOS = vocab_size + 1
+        self.PAD = vocab_size + 2
+
+        self.model = transformers.AutoModelForCausalLM.from_pretrained(ar_model_path).to(self.device)
+
+        BLACKLIST = 'censored,mosaic_censoring,photoshop_(medium),comic,monochrome,translated,greyscale,jpeg_artifacts,hard_translated,bar_censor,lowres,bad_pixiv_id,bad_id,translation_request,transparent_background,realistic,photo_(medium)'.split(',')
+        META = 'rating_e,rating_s,rating_q,score_perc_10,score_perc_20,score_perc_40,score_perc_60,score_perc_80,score_perc_90,score_perc_100,adjusted_score_perc_10,adjusted_score_perc_20,adjusted_score_perc_40,adjusted_score_perc_60,adjusted_score_perc_80,adjusted_score_perc_90,adjusted_score_perc_100'.split(',')
+        self.BLACKLIST = [[tag2id[t]] for t in BLACKLIST]
+        self.META = [tag2id[t] for t in META]
+
+    def token_id(self, token):
+        if token in self.tag2id:
+          return self.tag2id[token]
+        h = self.pad + 1 + (int(hashlib.sha1(token.encode('utf-8')).hexdigest(), 16) % (10 ** 9))
+        self.cache[h] = token
+        return h
+
+    def token(self, token_id):
+        if token_id in self.id2tag:
+          return self.id2tag[token_id]
+        assert token_id in self.cache
+        return self.cache[token_id]
+
+    def generate(self, prompt, max_augment=MAX_AUG, seed=None):
+      result = []
+      ids = [self.BOS]
+      index_mapping = []
+      for t in prompt:
+         result.append(self.token_id(t))
+         if t in self.tag2id:
+           ids.append(self.tag2id[t])
+           index_mapping.append(len(result) - 1)
+      if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+      bad_word_ids = [e[0] for e in self.BLACKLIST] + self.META
+      bad_word_ids.extend(range(2000, self.BOS - 1))
+      bad_word_ids = [[x] for x in set(bad_word_ids)]
+
+      gens = self.model.generate(
+          input_ids=torch.tensor(np.array([ids], dtype=np.int32)).to(self.device),
+          temperature=1.0,  # !!!
+          top_p=0.9,
+          do_sample=True,
+          min_length=max_augment + 2, max_length=max_augment + 2,
+          pad_token_id=self.PAD,
+          bos_token_id=self.BOS,
+          no_repeat_ngram_size=1,
+          bad_words_ids=bad_word_ids).cpu().numpy()[0, 1:-1]
+      assert len(gens) >= len(index_mapping)
+      for i in range(len(index_mapping)):
+          assert result[index_mapping[i]] == gens[i]
+      for i in range(len(index_mapping), len(gens)):
+          result.append(gens[i])
+
+      return [self.token(x) for x in result]
+
+    def encode_one(self, text, max_length=50, add_special_tokens=True, augment=True, max_augment=MAX_AUG, seed=None, **kwargs):
+        text = text.replace(',', ' ').split(' ')
+        text = [s for s in text if s]
+        if '__NO_AUGMENT__' in text:
+          augment = False
+          text = [s for s in text if s != '__NO_AUGMENT__']
+        print('Called for:', text)
+        if len(text) > 0 and augment:
+          text = self.generate(text, max_augment=max_augment, seed=seed)
+          print('Generated:', text)
+        text = [self.token_id(s) for s in text]
+        text = text[:max_length]
+        if add_special_tokens:
+          text.extend([self.pad] * (max_length - len(text)))
+        return np.array(text)
+
+    def __call__(self, text, max_length=50, add_special_tokens=True, augment=True, max_augment=MAX_AUG, **kwargs):
+        print('Final call with:', augment, max_augment)
+        if isinstance(text, list):
+            res = np.array([self.encode_one(s, add_special_tokens=add_special_tokens, augment=augment, max_augment=max_augment, **kwargs) for s in text])
+        else:
+          res = self.encode_one(text, add_special_tokens=add_special_tokens, augment=augment, max_augment=max_augment, **kwargs)
+        res = torch.tensor(res)
+        return {'input_ids': res}
+
+
+
+
+class WrappedTransformerEmbedder(TransformerEmbedder):
+    def __init__(self, device='cuda', max_seq_len=77, ar_model_path='', **kwargs):
+        super().__init__(device=device, max_seq_len=max_seq_len, **kwargs)
+        self.tokenizer = TagTokenizer(ar_model_path, max_seq_len, device=device)
+        self.device = device
+        self.max_length = max_seq_len
+        self.freeze()
+
+    def freeze(self):
+        self.transformer = self.transformer.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, text, augment=True, **kwargs):
+        batch_encoding = self.tokenizer(text, max_length=self.max_length, augment=augment, **kwargs)
+        if isinstance(batch_encoding, dict):
+            batch_encoding = batch_encoding['input_ids']
+        tokens = torch.clamp(batch_encoding, 0, self.tokenizer.pad)
+        tokens = batch_encoding.to(self.device)
+        z = super().forward(tokens)
+        return z
+
+    def encode(self, text):
+        return self(text)
 
