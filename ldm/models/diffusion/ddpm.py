@@ -659,17 +659,17 @@ class LatentDiffusion(DDPM):
             raise NotImplementedError(f"encoder_posterior of type '{type(encoder_posterior)}' not yet implemented")
         return self.scale_factor * z
 
-    def get_learned_conditioning(self, c):
+    def get_learned_conditioning(self, c, **kwargs):
         if self.cond_stage_forward is None:
             if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
-                c = self.cond_stage_model.encode(c)
+                c = self.cond_stage_model.encode(c, **kwargs)
                 if isinstance(c, DiagonalGaussianDistribution):
                     c = c.mode()
             else:
-                c = self.cond_stage_model(c)
+                c = self.cond_stage_model(c, **kwargs)
         else:
             assert hasattr(self.cond_stage_model, self.cond_stage_forward)
-            c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
+            c = getattr(self.cond_stage_model, self.cond_stage_forward)(c, **kwargs)
         return c
 
     def meshgrid(self, h, w):

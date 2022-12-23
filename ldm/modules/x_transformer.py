@@ -7,6 +7,14 @@ from inspect import isfunction
 from collections import namedtuple
 from einops import rearrange, repeat, reduce
 
+try:
+    import xformers
+    import xformers.ops
+    XFORMERS_AVAILABLE = True
+except:
+    XFORMERS_AVAILABLE = False
+
+
 # constants
 
 DEFAULT_DIM_HEAD = 64
@@ -212,6 +220,7 @@ class FeedForward(nn.Module):
 
 
 # attention.
+# attention.
 class Attention(nn.Module):
     def __init__(
             self,
@@ -240,6 +249,7 @@ class Attention(nn.Module):
         self.to_q = nn.Linear(dim, inner_dim, bias=False)
         self.to_k = nn.Linear(dim, inner_dim, bias=False)
         self.to_v = nn.Linear(dim, inner_dim, bias=False)
+        self.dropout_prob = dropout
         self.dropout = nn.Dropout(dropout)
 
         # talking heads
@@ -297,72 +307,90 @@ class Attention(nn.Module):
         k = self.to_k(k_input)
         v = self.to_v(v_input)
 
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), (q, k, v))
+        if not XFORMERS_AVAILABLE:
 
-        input_mask = None
-        if any(map(exists, (mask, context_mask))):
-            q_mask = default(mask, lambda: torch.ones((b, n), device=device).bool())
-            k_mask = q_mask if not exists(context) else context_mask
-            k_mask = default(k_mask, lambda: torch.ones((b, k.shape[-2]), device=device).bool())
-            q_mask = rearrange(q_mask, 'b i -> b () i ()')
-            k_mask = rearrange(k_mask, 'b j -> b () () j')
-            input_mask = q_mask * k_mask
+          q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), (q, k, v))
+  
+          input_mask = None
+          if any(map(exists, (mask, context_mask))):
+              q_mask = default(mask, lambda: torch.ones((b, n), device=device).bool())
+              k_mask = q_mask if not exists(context) else context_mask
+              k_mask = default(k_mask, lambda: torch.ones((b, k.shape[-2]), device=device).bool())
+              q_mask = rearrange(q_mask, 'b i -> b () i ()')
+              k_mask = rearrange(k_mask, 'b j -> b () () j')
+              input_mask = q_mask * k_mask
+  
+          if self.num_mem_kv > 0:
+              mem_k, mem_v = map(lambda t: repeat(t, 'h n d -> b h n d', b=b), (self.mem_k, self.mem_v))
+              k = torch.cat((mem_k, k), dim=-2)
+              v = torch.cat((mem_v, v), dim=-2)
+              if exists(input_mask):
+                  input_mask = F.pad(input_mask, (self.num_mem_kv, 0), value=True)
+  
+          dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
+          mask_value = max_neg_value(dots)
+  
+          if exists(prev_attn):
+              dots = dots + prev_attn
+  
+          pre_softmax_attn = dots
+  
+          if talking_heads:
+              dots = einsum('b h i j, h k -> b k i j', dots, self.pre_softmax_proj).contiguous()
+  
+          if exists(rel_pos):
+              dots = rel_pos(dots)
+  
+          if exists(input_mask):
+              dots.masked_fill_(~input_mask, mask_value)
+              del input_mask
+  
+          if self.causal:
+              i, j = dots.shape[-2:]
+              r = torch.arange(i, device=device)
+              mask = rearrange(r, 'i -> () () i ()') < rearrange(r, 'j -> () () () j')
+              mask = F.pad(mask, (j - i, 0), value=False)
+              dots.masked_fill_(mask, mask_value)
+              del mask
+  
+          if exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1]:
+              top, _ = dots.topk(self.sparse_topk, dim=-1)
+              vk = top[..., -1].unsqueeze(-1).expand_as(dots)
+              mask = dots < vk
+              dots.masked_fill_(mask, mask_value)
+              del mask
+  
+          attn = self.attn_fn(dots, dim=-1)
+  
+          post_softmax_attn = attn
+  
+          attn = self.dropout(attn)
+  
+          if talking_heads:
+              attn = einsum('b h i j, h k -> b k i j', attn, self.post_softmax_proj).contiguous()
+  
+          out = einsum('b h i j, b h j d -> b h i d', attn, v)
+          out = rearrange(out, 'b h n d -> b n (h d)')
+  
+          intermediates = Intermediates(
+              pre_softmax_attn=pre_softmax_attn,
+              post_softmax_attn=post_softmax_attn
+          )
 
-        if self.num_mem_kv > 0:
-            mem_k, mem_v = map(lambda t: repeat(t, 'h n d -> b h n d', b=b), (self.mem_k, self.mem_v))
-            k = torch.cat((mem_k, k), dim=-2)
-            v = torch.cat((mem_v, v), dim=-2)
-            if exists(input_mask):
-                input_mask = F.pad(input_mask, (self.num_mem_kv, 0), value=True)
+        else:
+          assert not any(map(exists, (mask, context_mask)))
+          assert not self.causal
+          assert not exists(self.sparse_topk)
+          assert not exists(prev_attn)
+          assert self.num_mem_kv <= 0
 
-        dots = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
-        mask_value = max_neg_value(dots)
-
-        if exists(prev_attn):
-            dots = dots + prev_attn
-
-        pre_softmax_attn = dots
-
-        if talking_heads:
-            dots = einsum('b h i j, h k -> b k i j', dots, self.pre_softmax_proj).contiguous()
-
-        if exists(rel_pos):
-            dots = rel_pos(dots)
-
-        if exists(input_mask):
-            dots.masked_fill_(~input_mask, mask_value)
-            del input_mask
-
-        if self.causal:
-            i, j = dots.shape[-2:]
-            r = torch.arange(i, device=device)
-            mask = rearrange(r, 'i -> () () i ()') < rearrange(r, 'j -> () () () j')
-            mask = F.pad(mask, (j - i, 0), value=False)
-            dots.masked_fill_(mask, mask_value)
-            del mask
-
-        if exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1]:
-            top, _ = dots.topk(self.sparse_topk, dim=-1)
-            vk = top[..., -1].unsqueeze(-1).expand_as(dots)
-            mask = dots < vk
-            dots.masked_fill_(mask, mask_value)
-            del mask
-
-        attn = self.attn_fn(dots, dim=-1)
-        post_softmax_attn = attn
-
-        attn = self.dropout(attn)
-
-        if talking_heads:
-            attn = einsum('b h i j, h k -> b k i j', attn, self.post_softmax_proj).contiguous()
-
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-
-        intermediates = Intermediates(
-            pre_softmax_attn=pre_softmax_attn,
-            post_softmax_attn=post_softmax_attn
-        )
+          q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h).contiguous(), (q, k, v))
+          out = xformers.ops.memory_efficient_attention(
+                  q, k, v, attn_bias=None,
+                  #op=self.attn_fn, 
+                  p=self.dropout_prob)
+          out = rearrange(out, '(b h) n d -> b n (h d)', h=h, n=n)
+          intermediates = None
 
         return self.to_out(out), intermediates
 
